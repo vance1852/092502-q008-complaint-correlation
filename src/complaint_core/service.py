@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from .audit import append_event, canonical_json, digest, verify_chain
 from .clock import Clock, SystemClock
-from .domain import is_allowed_category
+from .domain import SITELESS_CATEGORIES, is_allowed_category
 from .errors import ConflictError, NotFoundError, PermissionDenied, ValidationError
 from .models import Actor, DomainRecord, Site, WriteReceipt
 from .storage import Database
@@ -169,16 +169,22 @@ class DomainService:
                            category: str, external_key: str, data: dict[str, Any]) -> WriteReceipt:
         if not isinstance(data, dict) or not data:
             raise ValidationError("data 必须是非空对象")
+        siteless = category in SITELESS_CATEGORIES and not str(site_id or "").strip()
+        if siteless:
+            site_id = ""
         payload = {"actor_id": actor_id, "site_id": site_id, "category": category,
                    "external_key": external_key, "data": data}
         with self.database.transaction(immediate=True) as connection:
             actor = self._actor(connection, actor_id)
             self._require(actor, "admin", "operator", "reviewer")
-            site = connection.execute("SELECT * FROM sites WHERE site_id=?", (site_id,)).fetchone()
-            if site is None:
-                raise NotFoundError("场所不存在")
-            if actor.organization_id != site["organization_id"] and actor.role != "admin":
-                raise PermissionDenied("不能写入其他组织的场所")
+            if siteless:
+                site_row = None
+            else:
+                site_row = connection.execute("SELECT * FROM sites WHERE site_id=?", (site_id,)).fetchone()
+                if site_row is None:
+                    raise NotFoundError("场所不存在")
+                if actor.organization_id != site_row["organization_id"] and actor.role != "admin":
+                    raise PermissionDenied("不能写入其他组织的场所")
             if not is_allowed_category(category):
                 raise ValidationError("资料类别不属于当前项目")
             external_key = self._identifier(external_key, "external_key")
@@ -186,8 +192,8 @@ class DomainService:
 
             def create() -> tuple[str, str, dict[str, Any]]:
                 existing = connection.execute(
-                    "SELECT * FROM domain_records WHERE site_id=? AND category=? AND external_key=?",
-                    (site_id, category, external_key),
+                    "SELECT * FROM domain_records WHERE site_id IS ? AND category=? AND external_key=?",
+                    (None if siteless else site_id, category, external_key),
                 ).fetchone()
                 if existing:
                     if existing["payload_hash"] != data_hash:
@@ -197,7 +203,8 @@ class DomainService:
                 connection.execute(
                     "INSERT INTO domain_records(record_id,site_id,category,external_key,payload_json,payload_hash,created_by,created_at) "
                     "VALUES(?,?,?,?,?,?,?,?)",
-                    (record_id, site_id, category, external_key, canonical_json(data), data_hash, actor_id, self._now()),
+                    (record_id, None if siteless else site_id, category, external_key,
+                     canonical_json(data), data_hash, actor_id, self._now()),
                 )
                 append_event(connection, actor_id=actor_id, action="domain_data.recorded",
                              resource_type="domain_record", resource_id=record_id,
