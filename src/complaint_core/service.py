@@ -209,10 +209,11 @@ class DomainService:
                                     action="record_domain_data", payload=payload, create=create)
 
     def get_site(self, site_id: str) -> Site:
-        row = self.database.connection.execute("SELECT * FROM sites WHERE site_id=?", (site_id,)).fetchone()
-        if row is None:
-            raise NotFoundError("场所不存在")
-        return Site(row["site_id"], row["organization_id"], row["name"], row["timezone_name"], row["version"])
+        with self.database.read() as connection:
+            row = connection.execute("SELECT * FROM sites WHERE site_id=?", (site_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("场所不存在")
+            return Site(row["site_id"], row["organization_id"], row["name"], row["timezone_name"], row["version"])
 
     def list_domain_data(self, site_id: str, category: str | None = None) -> list[DomainRecord]:
         parameters: list[Any] = [site_id]
@@ -222,16 +223,19 @@ class DomainService:
             parameters.append(category)
         query += " ORDER BY created_at, record_id"
         records = []
-        for row in self.database.connection.execute(query, parameters):
+        with self.database.read() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        for row in rows:
             records.append(DomainRecord(row["record_id"], row["site_id"], row["category"],
                                         row["external_key"], json.loads(row["payload_json"]),
                                         row["created_by"], row["created_at"]))
         return records
 
     def audit_events(self, after_sequence: int = 0) -> list[dict[str, Any]]:
-        rows = self.database.connection.execute(
-            "SELECT * FROM audit_events WHERE sequence>? ORDER BY sequence", (after_sequence,)
-        ).fetchall()
+        with self.database.read() as connection:
+            rows = connection.execute(
+                "SELECT * FROM audit_events WHERE sequence>? ORDER BY sequence", (after_sequence,)
+            ).fetchall()
         return [{"sequence": row["sequence"], "event_id": row["event_id"], "actor_id": row["actor_id"],
                  "action": row["action"], "resource_type": row["resource_type"],
                  "resource_id": row["resource_id"], "detail": json.loads(row["detail_json"]),
@@ -239,4 +243,5 @@ class DomainService:
                  "occurred_at": row["occurred_at"]} for row in rows]
 
     def verify_audit(self) -> tuple[bool, int]:
-        return verify_chain(self.database.connection)
+        with self.database.read() as connection:
+            return verify_chain(connection)

@@ -10,17 +10,25 @@ from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
 from .service import DomainService
+from .correlation import ComplaintService
 from .storage import Database
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          complaint_service: ComplaintService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
+    query = parse_qs(parsed.query)
     actor_id = headers.get("X-Actor-Id", "")
+    complaints = complaint_service or ComplaintService(service.database, service.clock)
+
+    def query_arg(name: str, default: str | None = None) -> str | None:
+        return query.get(name, [default])[0]
+
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
@@ -38,16 +46,47 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             receipt = service.record_domain_data(actor_id=actor_id, **body)
             return 200 if receipt.replayed else 201, receipt.__dict__
         if method == "GET" and parsed.path == "/domain-records":
-            query = parse_qs(parsed.query)
-            site_id = query.get("site_id", [""])[0]
+            site_id = query_arg("site_id", "")
             if not site_id:
                 raise ValidationError("site_id 不能为空")
-            category = query.get("category", [None])[0]
+            category = query_arg("category")
             return 200, {"items": [item.__dict__ for item in service.list_domain_data(site_id, category)]}
         if method == "GET" and parsed.path == "/audit-events":
-            query = parse_qs(parsed.query)
-            after = int(query.get("after_sequence", ["0"])[0])
+            after = int(query_arg("after_sequence", "0"))
             return 200, {"items": service.audit_events(after)}
+
+        # ----- 投诉关联模块 -----
+        if method == "POST" and parsed.path == "/correlation-rules":
+            receipt = complaints.register_rule_version(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "GET" and parsed.path == "/correlation-rules":
+            return 200, {"items": complaints.list_rules(query_arg("rule_id"))}
+        if method == "POST" and parsed.path == "/complaint-events":
+            receipt = complaints.register_complaint_event(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/correlation-versions/regenerate":
+            receipt = complaints.regenerate(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/candidate-decisions":
+            receipt = complaints.decide(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/case-confirmations":
+            receipt = complaints.confirm_case(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/case-confirmations/revoke":
+            receipt = complaints.revoke_confirmation(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "GET" and parsed.path == "/cases":
+            return 200, {"items": complaints.list_cases(query_arg("zone_id"), query_arg("status"))}
+        if method == "GET" and parsed.path.startswith("/cases/"):
+            case_id = parsed.path.rsplit("/", 1)[-1]
+            if parsed.path.endswith("/trace"):
+                case_id = parsed.path.split("/")[2]
+                return 200, complaints.get_case_trace(case_id)
+            if parsed.path.endswith("/contacts"):
+                case_id = parsed.path.split("/")[2]
+                return 200, {"items": complaints.get_contacts(actor_id=actor_id, case_id=case_id)}
+            return 200, complaints.get_case(case_id)
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -59,6 +98,7 @@ class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    complaints: ComplaintService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +109,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                self.complaints)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -99,7 +140,9 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    service = DomainService(database)
+    Handler.service = service
+    Handler.complaints = ComplaintService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()

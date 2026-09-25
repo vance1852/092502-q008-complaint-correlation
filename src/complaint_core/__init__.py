@@ -1,5 +1,6 @@
-"""环境投诉资料基础服务的服务端基础包。"""
+"""环境投诉资料基础服务与投诉关联模块。"""
 
+from .correlation import ComplaintService
 from .service import DomainService
 
-__all__ = ["DomainService"]
+__all__ = ["DomainService", "ComplaintService"]
